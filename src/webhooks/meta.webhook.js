@@ -3,22 +3,73 @@ const axios = require("axios");
 const Lead = require("../models/Lead");
 const WebhookLog = require("../models/WebhookLog");
 
+// Configuration
+const META_API_VERSION = "v21.0";
+const META_API_BASE_URL = `https://graph.facebook.com/${META_API_VERSION}`;
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 1000;
+
+/**
+ * Sleep utility for retry delays
+ */
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Retry wrapper for API calls with exponential backoff
+ */
+const withRetry = async (fn, retries = MAX_RETRIES) => {
+  let lastError;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      const isRetryable =
+        error.response?.status >= 500 ||
+        error.code === "ECONNRESET" ||
+        error.code === "ETIMEDOUT";
+
+      if (!isRetryable || attempt === retries) {
+        throw error;
+      }
+
+      const delay = RETRY_DELAY_MS * Math.pow(2, attempt - 1);
+      console.log(
+        `⚠️ Meta API attempt ${attempt} failed, retrying in ${delay}ms...`,
+      );
+      await sleep(delay);
+    }
+  }
+  throw lastError;
+};
+
 /**
  * Verify Meta webhook signature
  */
 const verifySignature = (payload, signature) => {
-  if (!signature) return false;
+  if (!signature || !process.env.META_APP_SECRET) return false;
 
-  const expectedSignature = crypto
-    .createHmac("sha256", process.env.META_APP_SECRET)
-    .update(payload)
-    .digest("hex");
+  try {
+    const expectedSignature = crypto
+      .createHmac("sha256", process.env.META_APP_SECRET)
+      .update(payload)
+      .digest("hex");
 
-  const receivedSignature = signature.replace("sha256=", "");
-  return crypto.timingSafeEqual(
-    Buffer.from(expectedSignature),
-    Buffer.from(receivedSignature),
-  );
+    const receivedSignature = signature.replace("sha256=", "");
+
+    // Ensure both buffers are the same length
+    if (expectedSignature.length !== receivedSignature.length) {
+      return false;
+    }
+
+    return crypto.timingSafeEqual(
+      Buffer.from(expectedSignature),
+      Buffer.from(receivedSignature),
+    );
+  } catch (error) {
+    console.error("Signature verification error:", error.message);
+    return false;
+  }
 };
 
 /**
@@ -43,48 +94,47 @@ const verifyWebhook = (req, res) => {
  * Fetch full lead details from Meta Graph API
  */
 const fetchLeadDetails = async (leadgenId) => {
-  try {
-    const response = await axios.get(
-      `https://graph.facebook.com/v18.0/${leadgenId}`,
-      {
-        params: {
-          access_token: process.env.META_ACCESS_TOKEN,
-          fields: "id,created_time,field_data,form_id,ad_id,campaign_id",
-        },
+  return withRetry(async () => {
+    const response = await axios.get(`${META_API_BASE_URL}/${leadgenId}`, {
+      params: {
+        access_token: process.env.META_ACCESS_TOKEN,
+        fields:
+          "id,created_time,field_data,form_id,ad_id,adset_id,campaign_id,ad_name,adset_name,campaign_name,platform",
       },
-    );
+      timeout: 10000,
+    });
     return response.data;
-  } catch (error) {
-    console.error(
-      "Error fetching Meta lead details:",
-      error.response?.data || error.message,
+  }).catch((error) => {
+    const errorDetails = error.response?.data?.error || error.message;
+    console.error("Error fetching Meta lead details:", errorDetails);
+    throw new Error(
+      `Failed to fetch lead details: ${JSON.stringify(errorDetails)}`,
     );
-    throw error;
-  }
+  });
 };
 
 /**
- * Fetch form name from Meta
+ * Fetch form details from Meta
  */
-const fetchFormName = async (formId) => {
-  try {
-    const response = await axios.get(
-      `https://graph.facebook.com/v18.0/${formId}`,
-      {
-        params: {
-          access_token: process.env.META_ACCESS_TOKEN,
-          fields: "name",
-        },
+const fetchFormDetails = async (formId) => {
+  if (!formId) return null;
+
+  return withRetry(async () => {
+    const response = await axios.get(`${META_API_BASE_URL}/${formId}`, {
+      params: {
+        access_token: process.env.META_ACCESS_TOKEN,
+        fields: "id,name,status,page",
       },
-    );
-    return response.data.name;
-  } catch (error) {
+      timeout: 10000,
+    });
+    return response.data;
+  }).catch((error) => {
     console.error(
-      "Error fetching form name:",
-      error.response?.data || error.message,
+      "Error fetching form details:",
+      error.response?.data?.error || error.message,
     );
     return null;
-  }
+  });
 };
 
 /**
@@ -137,6 +187,9 @@ const parseFieldData = (fieldData) => {
  * Handle Meta webhook events (POST request)
  */
 const handleWebhook = async (req, res) => {
+  // Respond immediately to Meta (they expect response within 20 seconds)
+  res.status(200).json({ received: true });
+
   const payload = req.body.toString();
   const signature = req.headers["x-hub-signature-256"];
 
@@ -154,64 +207,83 @@ const handleWebhook = async (req, res) => {
       if (!verifySignature(payload, signature)) {
         log.error = "Invalid signature";
         await log.save();
-        return res.status(401).json({ error: "Invalid signature" });
+        console.error("❌ Meta webhook: Invalid signature");
+        return;
       }
     }
 
     const data = JSON.parse(payload);
 
+    // Validate payload structure
+    if (!data.entry || !Array.isArray(data.entry)) {
+      log.error = "Invalid payload structure: missing entry array";
+      await log.save();
+      console.error("❌ Meta webhook: Invalid payload structure");
+      return;
+    }
+
     // Process each entry
-    for (const entry of data.entry || []) {
+    for (const entry of data.entry) {
+      const pageId = entry.id;
+
       for (const change of entry.changes || []) {
         if (change.field === "leadgen") {
-          const leadgenId = change.value.leadgen_id;
-          const formId = change.value.form_id;
-          const adId = change.value.ad_id;
+          const leadgenId = change.value?.leadgen_id;
+          const formId = change.value?.form_id;
+
+          if (!leadgenId) {
+            console.error("❌ Meta webhook: Missing leadgen_id");
+            continue;
+          }
 
           log.eventType = "leadgen";
 
           // Fetch full lead details from Meta API
-          const leadDetails = await fetchLeadDetails(leadgenId);
-          const formName = await fetchFormName(formId);
+          const [leadDetails, formDetails] = await Promise.all([
+            fetchLeadDetails(leadgenId),
+            fetchFormDetails(formId),
+          ]);
+
           const parsedData = parseFieldData(leadDetails.field_data);
 
-          // Create or update lead
+          // Create or update lead with all available fields
           const lead = await Lead.findOneAndUpdate(
             { platform: "meta", platformLeadId: leadgenId },
             {
               platform: "meta",
               platformLeadId: leadgenId,
-              formId: formId,
-              formName: formName,
-              adId: adId,
-              campaignId: leadDetails.campaign_id,
+              formId: formId || leadDetails.form_id,
+              formName: formDetails?.name || null,
+              adId: leadDetails.ad_id || change.value?.ad_id,
+              adName: leadDetails.ad_name || null,
+              adsetId: leadDetails.adset_id || null,
+              adsetName: leadDetails.adset_name || null,
+              campaignId: leadDetails.campaign_id || null,
+              campaignName: leadDetails.campaign_name || null,
+              pageId: pageId,
               ...parsedData,
               platformCreatedAt: leadDetails.created_time
                 ? new Date(leadDetails.created_time)
                 : new Date(),
               receivedAt: new Date(),
             },
-            { upsert: true, new: true },
+            { upsert: true, new: true, runValidators: true },
           );
 
           log.leadId = lead._id;
           log.processed = true;
-          console.log(`✅ Meta lead saved: ${lead._id}`);
+          console.log(
+            `✅ Meta lead saved: ${lead._id} (form: ${formDetails?.name || formId})`,
+          );
         }
       }
     }
 
     await log.save();
-
-    // Facebook expects a 200 response within 20 seconds
-    res.status(200).json({ received: true });
   } catch (error) {
-    console.error("Error processing Meta webhook:", error);
+    console.error("Error processing Meta webhook:", error.message);
     log.error = error.message;
     await log.save();
-
-    // Still return 200 to prevent Facebook from retrying
-    res.status(200).json({ received: true, error: error.message });
   }
 };
 

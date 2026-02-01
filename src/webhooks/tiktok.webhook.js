@@ -4,19 +4,32 @@ const WebhookLog = require("../models/WebhookLog");
 
 /**
  * Verify TikTok webhook signature
+ * TikTok uses HMAC-SHA256 for signature verification
  */
 const verifySignature = (payload, signature) => {
-  if (!signature) return false;
+  if (!signature || !process.env.TIKTOK_APP_SECRET) {
+    return false;
+  }
 
-  const expectedSignature = crypto
-    .createHmac("sha256", process.env.TIKTOK_APP_SECRET)
-    .update(payload)
-    .digest("hex");
+  try {
+    const expectedSignature = crypto
+      .createHmac("sha256", process.env.TIKTOK_APP_SECRET)
+      .update(payload)
+      .digest("hex");
 
-  return crypto.timingSafeEqual(
-    Buffer.from(expectedSignature),
-    Buffer.from(signature),
-  );
+    // Ensure both signatures are same length
+    if (expectedSignature.length !== signature.length) {
+      return false;
+    }
+
+    return crypto.timingSafeEqual(
+      Buffer.from(expectedSignature),
+      Buffer.from(signature),
+    );
+  } catch (error) {
+    console.error("TikTok signature verification error:", error.message);
+    return false;
+  }
 };
 
 /**
@@ -75,6 +88,9 @@ const parseTiktokLead = (leadData) => {
  * Handle TikTok webhook events (POST request)
  */
 const handleWebhook = async (req, res) => {
+  // Respond immediately to TikTok (they expect specific format)
+  res.status(200).json({ code: 0, message: "success" });
+
   const payload = req.body.toString();
   const signature =
     req.headers["x-tiktok-signature"] || req.headers["x-tt-signature"];
@@ -93,7 +109,8 @@ const handleWebhook = async (req, res) => {
       if (!verifySignature(payload, signature)) {
         log.error = "Invalid signature";
         await log.save();
-        return res.status(401).json({ error: "Invalid signature" });
+        console.error("❌ TikTok webhook: Invalid signature");
+        return;
       }
     }
 
@@ -103,48 +120,62 @@ const handleWebhook = async (req, res) => {
     const eventType = data.event || data.event_type || "lead_submitted";
     log.eventType = eventType;
 
-    // Handle lead events
+    // Handle lead events - TikTok can send data in various formats
     const leadData = data.lead || data.data?.lead || data;
     const leadId = leadData.lead_id || leadData.id || data.lead_id;
 
-    if (leadId) {
-      const parsedData = parseTiktokLead(leadData);
-
-      // Create or update lead
-      const lead = await Lead.findOneAndUpdate(
-        { platform: "tiktok", platformLeadId: leadId },
-        {
-          platform: "tiktok",
-          platformLeadId: leadId,
-          formId: leadData.form_id || data.form_id,
-          formName: leadData.form_name || data.form_name,
-          adId: leadData.ad_id || data.ad_id,
-          adName: leadData.ad_name || data.ad_name,
-          campaignId: leadData.campaign_id || data.campaign_id,
-          campaignName: leadData.campaign_name || data.campaign_name,
-          ...parsedData,
-          platformCreatedAt: leadData.create_time
-            ? new Date(leadData.create_time * 1000)
-            : new Date(),
-          receivedAt: new Date(),
-        },
-        { upsert: true, new: true },
-      );
-
-      log.leadId = lead._id;
-      log.processed = true;
-      console.log(`✅ TikTok lead saved: ${lead._id}`);
+    if (!leadId) {
+      log.error = "Missing lead_id in payload";
+      await log.save();
+      console.error("❌ TikTok webhook: Missing lead_id");
+      return;
     }
 
-    await log.save();
+    const parsedData = parseTiktokLead(leadData);
 
-    // TikTok expects 200 response
-    res.status(200).json({ code: 0, message: "success" });
+    // Parse TikTok timestamp (can be Unix seconds or milliseconds)
+    let platformCreatedAt = new Date();
+    if (leadData.create_time) {
+      const timestamp = parseInt(leadData.create_time, 10);
+      // If timestamp is in seconds (less than year 3000 in seconds)
+      platformCreatedAt =
+        timestamp < 32503680000
+          ? new Date(timestamp * 1000)
+          : new Date(timestamp);
+    }
+
+    // Create or update lead with all available fields
+    const lead = await Lead.findOneAndUpdate(
+      { platform: "tiktok", platformLeadId: leadId },
+      {
+        platform: "tiktok",
+        platformLeadId: leadId,
+        formId: leadData.form_id || data.form_id || null,
+        formName: leadData.form_name || data.form_name || null,
+        adId: leadData.ad_id || data.ad_id || null,
+        adName: leadData.ad_name || data.ad_name || null,
+        adsetId: leadData.adgroup_id || data.adgroup_id || null,
+        adsetName: leadData.adgroup_name || data.adgroup_name || null,
+        campaignId: leadData.campaign_id || data.campaign_id || null,
+        campaignName: leadData.campaign_name || data.campaign_name || null,
+        ...parsedData,
+        platformCreatedAt,
+        receivedAt: new Date(),
+      },
+      { upsert: true, new: true, runValidators: true },
+    );
+
+    log.leadId = lead._id;
+    log.processed = true;
+    console.log(
+      `✅ TikTok lead saved: ${lead._id} (form: ${leadData.form_name || leadData.form_id})`,
+    );
+
+    await log.save();
   } catch (error) {
-    console.error("Error processing TikTok webhook:", error);
+    console.error("Error processing TikTok webhook:", error.message);
     log.error = error.message;
     await log.save();
-    res.status(200).json({ code: 0, message: "success", error: error.message });
   }
 };
 

@@ -25,10 +25,19 @@ const leadSchema = new mongoose.Schema(
     adName: {
       type: String,
     },
+    adsetId: {
+      type: String,
+    },
+    adsetName: {
+      type: String,
+    },
     campaignId: {
       type: String,
     },
     campaignName: {
+      type: String,
+    },
+    pageId: {
       type: String,
     },
 

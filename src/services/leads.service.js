@@ -1,4 +1,29 @@
+const mongoose = require("mongoose");
 const Lead = require("../models/Lead");
+
+/**
+ * Validate MongoDB ObjectId
+ */
+const isValidObjectId = (id) => {
+  return mongoose.Types.ObjectId.isValid(id);
+};
+
+/**
+ * Create standardized error with status code
+ */
+const createError = (message, status = 400) => {
+  const error = new Error(message);
+  error.status = status;
+  return error;
+};
+
+/**
+ * Sanitize string input
+ */
+const sanitizeString = (str) => {
+  if (typeof str !== "string") return str;
+  return str.trim().slice(0, 1000); // Limit string length
+};
 
 /**
  * Get all leads with filters
@@ -66,11 +91,13 @@ const getLeads = async (filters = {}, options = {}) => {
  * Get lead by ID
  */
 const getLeadById = async (id) => {
+  if (!id || !isValidObjectId(id)) {
+    throw createError("Invalid lead ID format", 400);
+  }
+
   const lead = await Lead.findById(id);
   if (!lead) {
-    const error = new Error("Lead not found");
-    error.status = 404;
-    throw error;
+    throw createError("Lead not found", 404);
   }
   return lead;
 };
@@ -79,14 +106,43 @@ const getLeadById = async (id) => {
  * Update lead
  */
 const updateLead = async (id, updateData) => {
+  if (!id || !isValidObjectId(id)) {
+    throw createError("Invalid lead ID format", 400);
+  }
+
+  if (!updateData || typeof updateData !== "object") {
+    throw createError("Update data is required", 400);
+  }
+
   // Only allow updating certain fields
   const allowedFields = ["status", "notes", "customerName", "email", "phone"];
+  const validStatuses = ["new", "contacted", "qualified", "converted", "lost"];
   const filteredData = {};
 
   for (const field of allowedFields) {
     if (updateData[field] !== undefined) {
-      filteredData[field] = updateData[field];
+      // Validate status field
+      if (field === "status" && !validStatuses.includes(updateData[field])) {
+        throw createError(
+          `Invalid status. Must be one of: ${validStatuses.join(", ")}`,
+          400,
+        );
+      }
+
+      // Validate email format
+      if (field === "email" && updateData[field]) {
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(updateData[field])) {
+          throw createError("Invalid email format", 400);
+        }
+      }
+
+      filteredData[field] = sanitizeString(updateData[field]);
     }
+  }
+
+  if (Object.keys(filteredData).length === 0) {
+    throw createError("No valid fields to update", 400);
   }
 
   const lead = await Lead.findByIdAndUpdate(id, filteredData, {
@@ -95,9 +151,7 @@ const updateLead = async (id, updateData) => {
   });
 
   if (!lead) {
-    const error = new Error("Lead not found");
-    error.status = 404;
-    throw error;
+    throw createError("Lead not found", 404);
   }
 
   return lead;
@@ -107,11 +161,13 @@ const updateLead = async (id, updateData) => {
  * Delete lead
  */
 const deleteLead = async (id) => {
+  if (!id || !isValidObjectId(id)) {
+    throw createError("Invalid lead ID format", 400);
+  }
+
   const lead = await Lead.findByIdAndDelete(id);
   if (!lead) {
-    const error = new Error("Lead not found");
-    error.status = 404;
-    throw error;
+    throw createError("Lead not found", 404);
   }
   return lead;
 };
