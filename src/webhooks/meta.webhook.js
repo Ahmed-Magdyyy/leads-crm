@@ -187,10 +187,13 @@ const parseFieldData = (fieldData) => {
  * Handle Meta webhook events (POST request)
  */
 const handleWebhook = async (req, res) => {
+  console.log("📥 Meta webhook POST received");
+
   // Respond immediately to Meta (they expect response within 20 seconds)
   res.status(200).json({ received: true });
 
   const payload = req.body.toString();
+  console.log("📦 Payload:", payload.substring(0, 200));
   const signature = req.headers["x-hub-signature-256"];
 
   // Log the webhook
