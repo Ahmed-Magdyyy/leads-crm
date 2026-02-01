@@ -4,7 +4,7 @@ const Lead = require("../models/Lead");
 const WebhookLog = require("../models/WebhookLog");
 
 // Configuration
-const META_API_VERSION = "v21.0";
+const META_API_VERSION = "v24.0";
 const META_API_BASE_URL = `https://graph.facebook.com/${META_API_VERSION}`;
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 1000;
@@ -99,7 +99,7 @@ const fetchLeadDetails = async (leadgenId) => {
       params: {
         access_token: process.env.META_ACCESS_TOKEN,
         fields:
-          "id,created_time,field_data,form_id,ad_id,adset_id,campaign_id,ad_name,adset_name,campaign_name,platform",
+          "id,created_time,field_data,form_id,ad_id,adset_id,campaign_id,ad_name,adset_name,campaign_name",
       },
       timeout: 10000,
     });
